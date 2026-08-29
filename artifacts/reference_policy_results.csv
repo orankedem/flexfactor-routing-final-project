@@ -1,7 +1,7 @@
-policy,lambda,expected_added_approvals,success_opportunity_capture,expected_added_approved_value,value_opportunity_capture
-greedy,0.0,87.3506,0.462719,599132,0.42079
+policy,lambda,expected_added_approvals,success_capture,expected_added_approved_value,value_capture
+greedy,0.0,87.351,0.462719,599132,0.42079
 success_pressure,0.1,162.606,0.861364,1067185,0.749519
-balanced_success_pressure,0.15,161.694,0.856533,1084469,0.761658
+balanced_pressure,0.15,161.694,0.856533,1084469,0.761658
 value_pressure,0.2,140.055,0.741909,1212111,0.851305
 LP_success,,188.777,1.0,1299129,
 LP_value,,173.116,,1423827,1.0

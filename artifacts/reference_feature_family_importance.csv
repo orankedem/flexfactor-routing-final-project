@@ -1,0 +1,19 @@
+stage,family,normalized_gain_pct
+A1,historical temporal state,62.717
+A1,transaction context,15.508
+A1,route / interactions,14.349
+A1,amount,5.667
+A1,other,0.887
+A1,calendar,0.872
+A2,transaction context,31.76
+A2,historical temporal state,31.155
+A2,route / interactions,22.3
+A2,prior-attempt state,10.552
+A2,amount,3.928
+A2,calendar,0.305
+A3,historical temporal state,47.788
+A3,transaction context,22.063
+A3,route / interactions,17.598
+A3,prior-attempt state,8.236
+A3,amount,3.74
+A3,calendar,0.575
