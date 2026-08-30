@@ -1,0 +1,13 @@
+{
+  "capacity_scope_primary": "shared_all_attempts",
+  "capacity_shift": 0.3,
+  "pressure_definition": "(A_rt - B_rt) / max(0.30 * B_rt, 1)",
+  "success_score": "p_success - lambda * pressure",
+  "approved_value_score": "amount * p_success - lambda * median_amount * pressure",
+  "reference_lambdas": {
+    "success": 0.1,
+    "balanced_success": 0.15,
+    "approved_value": 0.2
+  },
+  "claim_guardrail": "Alternative-route gains are model-implied counterfactual estimates; causal lift requires controlled live validation."
+}
