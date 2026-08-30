@@ -269,6 +269,8 @@ def detailed_pressure_trace(
             score = p - lambda_ * pr
             feasible = feasible_after_choice(route, baseline_counts, policy_counts, shift)
             row = {
+                "event_id": eid,
+                "attempt": int(ev["attempt"]),
                 "route": route,
                 "raw_p_success": p,
                 "baseline_cumulative": baseline_counts[route],
@@ -278,6 +280,16 @@ def detailed_pressure_trace(
                 "feasible": feasible,
                 "is_logged_route": bool(r["is_logged_route"]),
             }
+
+            # A1 chronological-backtest event IDs were saved as:
+            #     A1__<policy_tx_id>
+            # The backtest parquet intentionally omitted _candidate_id, but
+            # this lets us recover the original candidate row exactly.
+            if int(ev["attempt"]) == 1 and str(eid).startswith("A1__"):
+                try:
+                    row["_policy_tx_id"] = int(str(eid).split("A1__", 1)[1])
+                except Exception:
+                    row["_policy_tx_id"] = str(eid).split("A1__", 1)[1]
             for c in [
                 "_candidate_id", "_policy_tx_id", "_row_id", "TransactionId",
                 "decay__route__rate__hl14p0d", "hist__merchant_route__logn__exp",
@@ -342,38 +354,152 @@ def _read_candidate_rows(matrix_path, candidate_ids, columns):
 
 
 def recompute_a1_candidate_probabilities(
-    artifacts: dict, trace_table: pd.DataFrame,
-    *, top_features: Iterable[str] | None = None,
+    artifacts: dict,
+    trace_table: pd.DataFrame,
+    *,
+    top_features: Iterable[str] | None = None,
+    event_meta: dict | None = None,
 ):
-    """Re-run exact frozen A1 XGBoost on exact candidate rows and verify scores."""
+    """
+    Re-run the exact frozen A1 XGBoost model for the candidates in one traced
+    event and verify the saved candidate score.
+
+    Important checkpoint detail:
+    `chronological_shadow_v1/candidate_scores/a1_candidates.parquet` was
+    intentionally saved WITHOUT `_candidate_id`. The original exact candidate
+    model matrix still contains `_candidate_id`, `_policy_tx_id`, and
+    `route_core`.
+
+    Therefore, if `_candidate_id` is absent, this function reconstructs it
+    deterministically from:
+
+        event_id = "A1__<policy_tx_id>"
+        candidate route = route_core
+
+    This is an exact key-based recovery, not an approximate feature match.
+    """
     import xgboost as xgb
 
     model_path = Path(artifacts["a1_model_json"])
     meta_path = Path(artifacts["a1_metadata"])
     matrix_path = Path(artifacts["a1_candidate_matrix"])
+
     for p in [model_path, meta_path, matrix_path]:
         if not p.exists():
             raise FileNotFoundError(p)
-    if "_candidate_id" not in trace_table.columns:
-        raise KeyError("Trace table does not contain _candidate_id")
 
+    trace = trace_table.copy()
+
+    # ------------------------------------------------------------
+    # Recover exact candidate IDs when the chronological-backtest
+    # checkpoint does not contain them.
+    # ------------------------------------------------------------
+    if "_candidate_id" not in trace.columns:
+        policy_tx_id = None
+
+        if "_policy_tx_id" in trace.columns:
+            vals = trace["_policy_tx_id"].dropna().unique()
+            if len(vals) == 1:
+                policy_tx_id = vals[0]
+
+        if policy_tx_id is None and "event_id" in trace.columns:
+            vals = trace["event_id"].dropna().astype(str).unique()
+            if len(vals) == 1 and vals[0].startswith("A1__"):
+                policy_tx_id = vals[0].split("A1__", 1)[1]
+
+        if policy_tx_id is None and event_meta is not None:
+            if "_policy_tx_id" in event_meta:
+                policy_tx_id = event_meta["_policy_tx_id"]
+            else:
+                eid = str(event_meta.get("event_id", ""))
+                if eid.startswith("A1__"):
+                    policy_tx_id = eid.split("A1__", 1)[1]
+
+        if policy_tx_id is None:
+            raise KeyError(
+                "Trace table does not contain _candidate_id and the A1 "
+                "_policy_tx_id could not be recovered. Re-run the decision "
+                "walkthrough cell after updating src/showcase.py, or pass "
+                "event_meta=meta."
+            )
+
+        # Match against the exact original A1 candidate matrix.
+        key_cols = ["_candidate_id", "_policy_tx_id", "route_core"]
+        key_frame = pd.read_parquet(matrix_path, columns=key_cols)
+
+        # Preserve numeric IDs when possible; fall back to string comparison.
+        numeric_pid = pd.to_numeric(pd.Series([policy_tx_id]), errors="coerce").iloc[0]
+        if pd.notna(numeric_pid):
+            matches = key_frame[
+                key_frame["_policy_tx_id"].eq(int(numeric_pid))
+            ].copy()
+        else:
+            matches = key_frame[
+                key_frame["_policy_tx_id"].astype(str).eq(str(policy_tx_id))
+            ].copy()
+
+        if matches.empty:
+            raise KeyError(
+                f"No original A1 candidate rows found for _policy_tx_id={policy_tx_id}"
+            )
+
+        route_key = matches[["_candidate_id", "route_core"]].copy()
+        route_key["route"] = route_key["route_core"].astype(str)
+        route_key = route_key.drop(columns="route_core")
+
+        trace["route"] = trace["route"].astype(str)
+        trace = trace.merge(
+            route_key,
+            on="route",
+            how="left",
+            validate="one_to_one",
+        )
+
+        if trace["_candidate_id"].isna().any():
+            missing_routes = trace.loc[
+                trace["_candidate_id"].isna(), "route"
+            ].tolist()
+            raise KeyError(
+                "Could not recover exact candidate IDs for routes: "
+                + ", ".join(map(str, missing_routes))
+            )
+
+        print(
+            "✓ Recovered exact _candidate_id values from "
+            "_policy_tx_id + route_core"
+        )
+
+    # ------------------------------------------------------------
+    # Re-run exact frozen model.
+    # ------------------------------------------------------------
     metadata = load_json(meta_path)
     feature_cols = list(metadata["feature_columns"])
     cat_cols = list(metadata["categorical_features"])
     num_cols = list(metadata["numeric_features"])
     levels = metadata.get("categorical_levels", {})
 
-    ids = trace_table["_candidate_id"].dropna().tolist()
+    ids = trace["_candidate_id"].astype("int64").tolist()
     Xraw = _read_candidate_rows(matrix_path, ids, feature_cols)
-    order = {v: i for i, v in enumerate(ids)}
-    Xraw["__order"] = Xraw["_candidate_id"].map(order)
-    Xraw = Xraw.sort_values("__order").drop(columns="__order").reset_index(drop=True)
+
+    # Preserve trace order.
+    order = {int(v): i for i, v in enumerate(ids)}
+    Xraw["__order"] = Xraw["_candidate_id"].astype("int64").map(order)
+    Xraw = (
+        Xraw.sort_values("__order")
+        .drop(columns="__order")
+        .reset_index(drop=True)
+    )
 
     X = Xraw[feature_cols].copy()
+
     for c in cat_cols:
         vals = X[c].astype("string").fillna("__MISSING__").astype(str)
         cats = levels.get(c)
-        X[c] = pd.Categorical(vals, categories=list(map(str, cats))) if cats is not None else vals.astype("category")
+        if cats is not None:
+            X[c] = pd.Categorical(vals, categories=list(map(str, cats)))
+        else:
+            X[c] = vals.astype("category")
+
     for c in num_cols:
         X[c] = pd.to_numeric(X[c], errors="coerce").astype("float32")
 
@@ -381,19 +507,51 @@ def recompute_a1_candidate_probabilities(
     model.load_model(str(model_path))
     p = model.predict_proba(X)[:, 1]
 
-    key = trace_table[["_candidate_id", "route", "raw_p_success"]].copy()
-    verification = Xraw[["_candidate_id"]].copy()
-    verification["recomputed_p_success"] = p
-    verification = verification.merge(key, on="_candidate_id", how="left", validate="one_to_one")
-    verification["abs_difference"] = (verification["recomputed_p_success"] - verification["raw_p_success"]).abs()
-    verification = verification[["_candidate_id", "route", "raw_p_success", "recomputed_p_success", "abs_difference"]]
+    key = trace[["_candidate_id", "route", "raw_p_success"]].copy()
+    key["_candidate_id"] = key["_candidate_id"].astype("int64")
 
-    requested = [f for f in (top_features or []) if f in Xraw.columns]
+    verification = Xraw[["_candidate_id"]].copy()
+    verification["_candidate_id"] = verification["_candidate_id"].astype("int64")
+    verification["recomputed_p_success"] = p
+    verification = verification.merge(
+        key,
+        on="_candidate_id",
+        how="left",
+        validate="one_to_one",
+    )
+    verification["abs_difference"] = (
+        verification["recomputed_p_success"]
+        - verification["raw_p_success"]
+    ).abs()
+
+    verification = verification[
+        [
+            "_candidate_id",
+            "route",
+            "raw_p_success",
+            "recomputed_p_success",
+            "abs_difference",
+        ]
+    ]
+
+    requested = [
+        f for f in (top_features or [])
+        if f in Xraw.columns
+    ]
+
     feature_values = None
     if requested:
-        feature_values = Xraw[["_candidate_id"] + requested].merge(
-            key[["_candidate_id", "route"]], on="_candidate_id", how="left", validate="one_to_one"
+        feature_values = Xraw[
+            ["_candidate_id"] + requested
+        ].merge(
+            key[["_candidate_id", "route"]],
+            on="_candidate_id",
+            how="left",
+            validate="one_to_one",
         )
-        feature_values = feature_values[["_candidate_id", "route"] + requested]
+        feature_values = feature_values[
+            ["_candidate_id", "route"] + requested
+        ]
 
     return verification, feature_values, metadata
+
