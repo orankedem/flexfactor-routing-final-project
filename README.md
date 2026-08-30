@@ -115,9 +115,9 @@ Untouched June evaluation:
 | A2 | 0.794 | 0.212 | 0.151 | 0.0440 | 0.0019 |
 | A3 | 0.871 | 0.137 | 0.207 | 0.0180 | 0.0026 |
 
-The notebook also compares mean predicted probability with the success actually observed on the logged route and shows quantile-binned reliability curves.
+The notebook also compares mean predicted probability with the success actually observed on the logged route and shows fixed-probability-bin reliability curves.
 
-Sparse extreme A2/A3 predictions are reported separately with their sample counts so that very small tail bins are not visually over-weighted.
+The sparse high-probability A2/A3 bins are retained in the calibration figure, but their transaction counts and share of the stage population are reported directly so that visually extreme points are interpreted in proportion to the small amount of evidence behind them.
 
 ---
 
