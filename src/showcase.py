@@ -353,6 +353,145 @@ def _read_candidate_rows(matrix_path, candidate_ids, columns):
     return frame
 
 
+def _decode_xgboost_string_categories(enc: dict):
+    """
+    Decode the UTF-8 string-category representation stored in XGBoost JSON.
+    XGBoost >=3.1 persists category vocabularies in the model itself.
+    """
+    offsets = enc.get("offsets", [])
+    values = enc.get("values", [])
+
+    if not offsets:
+        return None
+
+    raw = bytes(values)
+    return [
+        raw[offsets[i]:offsets[i + 1]].decode("utf-8")
+        for i in range(len(offsets) - 1)
+    ]
+
+
+def load_model_category_levels(model_path: str | Path) -> dict:
+    """
+    Read categorical vocabularies directly from the serialized XGBoost model.
+
+    This is preferable to reconstructing categories from the inference batch:
+    XGBoost categorical splits depend on the training-time category encoding.
+    """
+    model_path = Path(model_path)
+    with open(model_path, "r", encoding="utf-8") as f:
+        model_json = json.load(f)
+
+    learner = model_json["learner"]
+    feature_names = learner.get("feature_names", [])
+    feature_types = learner.get("feature_types", [])
+
+    cats_block = (
+        learner
+        .get("gradient_booster", {})
+        .get("model", {})
+        .get("cats", {})
+    )
+    encodings = cats_block.get("enc", [])
+
+    levels = {}
+
+    for i, (name, ftype) in enumerate(zip(feature_names, feature_types)):
+        if ftype != "c" or i >= len(encodings):
+            continue
+
+        enc = encodings[i]
+
+        # String categories are stored as flattened UTF-8 bytes + offsets.
+        decoded = _decode_xgboost_string_categories(enc)
+        if decoded is not None:
+            levels[name] = decoded
+            continue
+
+        # Numeric categorical values are stored directly.
+        if "values" in enc:
+            levels[name] = enc["values"]
+
+    return levels
+
+
+def align_categories_to_frozen_model(
+    X: pd.DataFrame,
+    categorical_columns,
+    model_category_levels: dict,
+):
+    """
+    Align inference categories to the exact vocabulary stored in the model.
+
+    For an inference value unseen during training:
+      1. use an explicit __OTHER__ category if the model was trained with one;
+      2. otherwise represent it as missing.
+
+    The function returns both the aligned frame and a per-row count of fields
+    that required unseen-category handling.
+    """
+    out = X.copy()
+    unseen_per_row = pd.Series(0, index=out.index, dtype="int64")
+
+    for c in categorical_columns:
+        if c not in out.columns:
+            continue
+
+        categories = model_category_levels.get(c)
+
+        # If the serialized booster does not expose a vocabulary for this
+        # metadata-declared categorical column, keep a stable pandas category.
+        if categories is None:
+            out[c] = (
+                out[c]
+                .astype("string")
+                .fillna("__MISSING__")
+                .astype("category")
+            )
+            continue
+
+        # Most project categorical features are strings, but preserve numeric
+        # category types when the model stored numeric categories.
+        string_categories = all(isinstance(v, str) for v in categories)
+
+        if string_categories:
+            values = out[c].astype("string")
+            valid = values.isin(categories)
+            actual_missing = values.isna()
+
+            unseen = (~valid) & (~actual_missing)
+            unseen_per_row = unseen_per_row + unseen.astype("int64")
+
+            if "__OTHER__" in categories:
+                mapped = values.where(valid | actual_missing, "__OTHER__")
+            else:
+                mapped = values.where(valid, pd.NA)
+
+            if "__MISSING__" in categories:
+                mapped = mapped.fillna("__MISSING__")
+
+            out[c] = pd.Categorical(
+                mapped,
+                categories=categories,
+            )
+
+        else:
+            numeric_values = pd.to_numeric(out[c], errors="coerce")
+            valid = numeric_values.isin(categories)
+            actual_missing = numeric_values.isna()
+
+            unseen = (~valid) & (~actual_missing)
+            unseen_per_row = unseen_per_row + unseen.astype("int64")
+
+            mapped = numeric_values.where(valid)
+            out[c] = pd.Categorical(
+                mapped,
+                categories=categories,
+            )
+
+    return out, unseen_per_row
+
+
 def recompute_a1_candidate_probabilities(
     artifacts: dict,
     trace_table: pd.DataFrame,
@@ -476,7 +615,6 @@ def recompute_a1_candidate_probabilities(
     feature_cols = list(metadata["feature_columns"])
     cat_cols = list(metadata["categorical_features"])
     num_cols = list(metadata["numeric_features"])
-    levels = metadata.get("categorical_levels", {})
 
     ids = trace["_candidate_id"].astype("int64").tolist()
     Xraw = _read_candidate_rows(matrix_path, ids, feature_cols)
@@ -492,13 +630,15 @@ def recompute_a1_candidate_probabilities(
 
     X = Xraw[feature_cols].copy()
 
-    for c in cat_cols:
-        vals = X[c].astype("string").fillna("__MISSING__").astype(str)
-        cats = levels.get(c)
-        if cats is not None:
-            X[c] = pd.Categorical(vals, categories=list(map(str, cats)))
-        else:
-            X[c] = vals.astype("category")
+    # Use the category vocabulary serialized inside the frozen booster itself.
+    # Reconstructing categories from the small inference batch can produce a
+    # different categorical encoding and is not valid for native XGBoost cats.
+    model_levels = load_model_category_levels(model_path)
+    X, unseen_per_row = align_categories_to_frozen_model(
+        X,
+        cat_cols,
+        model_levels,
+    )
 
     for c in num_cols:
         X[c] = pd.to_numeric(X[c], errors="coerce").astype("float32")
@@ -523,6 +663,7 @@ def recompute_a1_candidate_probabilities(
         verification["recomputed_p_success"]
         - verification["raw_p_success"]
     ).abs()
+    verification["unseen_category_fields_handled"] = unseen_per_row.to_numpy()
 
     verification = verification[
         [
@@ -531,6 +672,7 @@ def recompute_a1_candidate_probabilities(
             "raw_p_success",
             "recomputed_p_success",
             "abs_difference",
+            "unseen_category_fields_handled",
         ]
     ]
 
