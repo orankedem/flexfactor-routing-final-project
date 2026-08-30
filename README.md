@@ -205,9 +205,7 @@ For that event it shows:
 7. adjusted policy score;
 8. greedy route versus final route.
 
-The notebook then links the backtest event to the exact original candidate feature rows and reloads the frozen XGBoost model.
-
-For native categorical XGBoost features, inference categories are aligned to the training vocabulary serialized inside the model. Unseen raw labels are mapped to an explicit `__OTHER__` category when one exists, otherwise to missing. The notebook reports the saved versus recomputed probability difference.
+The notebook then links the backtest event to the exact original candidate feature rows. The saved candidate probability is the canonical value actually used by the chronological policy backtest. As an additional reproducibility check, the notebook reloads the frozen XGBoost model and attempts a fresh prediction using the model's stored categorical vocabulary; when the current runtime reproduces the historical native-categorical pipeline, the saved and fresh probabilities are compared directly.
 
 ---
 

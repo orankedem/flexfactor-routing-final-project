@@ -355,28 +355,74 @@ def _read_candidate_rows(matrix_path, candidate_ids, columns):
 
 def _decode_xgboost_string_categories(enc: dict):
     """
-    Decode the UTF-8 string-category representation stored in XGBoost JSON.
-    XGBoost >=3.1 persists category vocabularies in the model itself.
+    Decode string categories from XGBoost's serialized category container.
+
+    JSON/UBJSON serialization may expose byte values as signed integers in
+    some environments. Values in [-128, 255] are therefore normalized back
+    to uint8 with two's-complement semantics.
     """
-    offsets = enc.get("offsets", [])
-    values = enc.get("values", [])
+    offsets = [int(v) for v in enc.get("offsets", [])]
+    values = [int(v) for v in enc.get("values", [])]
 
     if not offsets:
         return None
 
-    raw = bytes(values)
-    return [
-        raw[offsets[i]:offsets[i + 1]].decode("utf-8")
-        for i in range(len(offsets) - 1)
-    ]
+    # Normal XGBoost string storage is UTF-8 bytes.
+    if all(-128 <= v <= 255 for v in values):
+        raw = bytes((v & 0xFF) for v in values)
+        return [
+            raw[offsets[i]:offsets[i + 1]].decode("utf-8", errors="strict")
+            for i in range(len(offsets) - 1)
+        ]
+
+    # Defensive fallback for a JSON representation containing Unicode
+    # codepoints rather than bytes.
+    if all(0 <= v <= 0x10FFFF for v in values):
+        return [
+            "".join(chr(v) for v in values[offsets[i]:offsets[i + 1]])
+            for i in range(len(offsets) - 1)
+        ]
+
+    raise ValueError("Unsupported serialized XGBoost string-category encoding")
 
 
-def load_model_category_levels(model_path: str | Path) -> dict:
+def _categories_from_booster_api(model_path: str | Path) -> dict:
     """
-    Read categorical vocabularies directly from the serialized XGBoost model.
+    Preferred category extraction path for XGBoost >= 3.1.
 
-    This is preferable to reconstructing categories from the inference batch:
-    XGBoost categorical splits depend on the training-time category encoding.
+    Uses Booster.get_categories(export_to_arrow=True), which delegates the
+    model's category representation to XGBoost itself instead of reverse-
+    engineering its serialization.
+    """
+    import xgboost as xgb
+
+    booster = xgb.Booster()
+    booster.load_model(str(model_path))
+
+    categories = booster.get_categories(export_to_arrow=True)
+    arrow_items = categories.to_arrow()
+
+    levels = {}
+    for item in arrow_items:
+        if not isinstance(item, (tuple, list)) or len(item) != 2:
+            continue
+
+        feature_name, array = item
+        if array is None:
+            continue
+
+        # PyArrow arrays expose to_pylist(). Keep the stored scalar type.
+        if hasattr(array, "to_pylist"):
+            levels[str(feature_name)] = array.to_pylist()
+        else:
+            levels[str(feature_name)] = list(array)
+
+    return levels
+
+
+def _categories_from_model_json(model_path: str | Path) -> dict:
+    """
+    Fallback parser for the documented XGBoost JSON category format.
     """
     model_path = Path(model_path)
     with open(model_path, "r", encoding="utf-8") as f:
@@ -402,17 +448,49 @@ def load_model_category_levels(model_path: str | Path) -> dict:
 
         enc = encodings[i]
 
-        # String categories are stored as flattened UTF-8 bytes + offsets.
-        decoded = _decode_xgboost_string_categories(enc)
-        if decoded is not None:
-            levels[name] = decoded
-            continue
+        if "offsets" in enc and "values" in enc:
+            decoded = _decode_xgboost_string_categories(enc)
+            if decoded is not None:
+                levels[name] = decoded
+                continue
 
-        # Numeric categorical values are stored directly.
         if "values" in enc:
             levels[name] = enc["values"]
 
     return levels
+
+
+def load_model_category_levels(model_path: str | Path) -> dict:
+    """
+    Load exact training-time category vocabularies from the frozen booster.
+
+    The official XGBoost category-export API is used first. A parser for the
+    documented serialized JSON format is retained only as a compatibility
+    fallback.
+    """
+    api_error = None
+
+    try:
+        levels = _categories_from_booster_api(model_path)
+        if levels:
+            return levels
+    except Exception as exc:
+        api_error = exc
+
+    try:
+        levels = _categories_from_model_json(model_path)
+        if levels:
+            return levels
+    except Exception as json_exc:
+        if api_error is not None:
+            raise RuntimeError(
+                "Could not extract frozen-model categorical vocabularies "
+                f"through either XGBoost's API ({api_error}) or JSON fallback "
+                f"({json_exc})."
+            ) from json_exc
+        raise
+
+    return {}
 
 
 def align_categories_to_frozen_model(
@@ -628,54 +706,12 @@ def recompute_a1_candidate_probabilities(
         .reset_index(drop=True)
     )
 
-    X = Xraw[feature_cols].copy()
-
-    # Use the category vocabulary serialized inside the frozen booster itself.
-    # Reconstructing categories from the small inference batch can produce a
-    # different categorical encoding and is not valid for native XGBoost cats.
-    model_levels = load_model_category_levels(model_path)
-    X, unseen_per_row = align_categories_to_frozen_model(
-        X,
-        cat_cols,
-        model_levels,
-    )
-
-    for c in num_cols:
-        X[c] = pd.to_numeric(X[c], errors="coerce").astype("float32")
-
-    model = xgb.XGBClassifier()
-    model.load_model(str(model_path))
-    p = model.predict_proba(X)[:, 1]
-
     key = trace[["_candidate_id", "route", "raw_p_success"]].copy()
     key["_candidate_id"] = key["_candidate_id"].astype("int64")
 
-    verification = Xraw[["_candidate_id"]].copy()
-    verification["_candidate_id"] = verification["_candidate_id"].astype("int64")
-    verification["recomputed_p_success"] = p
-    verification = verification.merge(
-        key,
-        on="_candidate_id",
-        how="left",
-        validate="one_to_one",
-    )
-    verification["abs_difference"] = (
-        verification["recomputed_p_success"]
-        - verification["raw_p_success"]
-    ).abs()
-    verification["unseen_category_fields_handled"] = unseen_per_row.to_numpy()
-
-    verification = verification[
-        [
-            "_candidate_id",
-            "route",
-            "raw_p_success",
-            "recomputed_p_success",
-            "abs_difference",
-            "unseen_category_fields_handled",
-        ]
-    ]
-
+    # Feature values can always be shown once the exact candidate row has
+    # been recovered, even if a future XGBoost runtime cannot reproduce
+    # native-categorical inference byte-for-byte.
     requested = [
         f for f in (top_features or [])
         if f in Xraw.columns
@@ -694,6 +730,68 @@ def recompute_a1_candidate_probabilities(
         feature_values = feature_values[
             ["_candidate_id", "route"] + requested
         ]
+
+    verification = key.copy()
+    verification["recomputed_p_success"] = np.nan
+    verification["abs_difference"] = np.nan
+    verification["unseen_category_fields_handled"] = 0
+    verification["replay_status"] = "not_attempted"
+
+    try:
+        X = Xraw[feature_cols].copy()
+
+        # Use the exact training vocabulary stored in the frozen booster.
+        model_levels = load_model_category_levels(model_path)
+        X, unseen_per_row = align_categories_to_frozen_model(
+            X,
+            cat_cols,
+            model_levels,
+        )
+
+        for c in num_cols:
+            X[c] = pd.to_numeric(X[c], errors="coerce").astype("float32")
+
+        model = xgb.XGBClassifier()
+        model.load_model(str(model_path))
+        p = model.predict_proba(X)[:, 1]
+
+        pred_frame = Xraw[["_candidate_id"]].copy()
+        pred_frame["_candidate_id"] = pred_frame["_candidate_id"].astype("int64")
+        pred_frame["recomputed_p_success"] = p
+        pred_frame["unseen_category_fields_handled"] = unseen_per_row.to_numpy()
+
+        verification = key.merge(
+            pred_frame,
+            on="_candidate_id",
+            how="left",
+            validate="one_to_one",
+        )
+        verification["abs_difference"] = (
+            verification["recomputed_p_success"]
+            - verification["raw_p_success"]
+        ).abs()
+        verification["replay_status"] = "recomputed_from_frozen_model"
+
+    except Exception as exc:
+        # The saved model_score is the exact value used by the historical
+        # policy backtest. A fresh replay is a reproducibility check, not a
+        # prerequisite for the policy result itself.
+        verification["replay_status"] = (
+            "saved_backtest_score_used; fresh categorical replay unavailable: "
+            + str(exc).splitlines()[0][:180]
+        )
+
+    verification = verification[
+        [
+            "_candidate_id",
+            "route",
+            "raw_p_success",
+            "recomputed_p_success",
+            "abs_difference",
+            "unseen_category_fields_handled",
+            "replay_status",
+        ]
+    ]
 
     return verification, feature_values, metadata
 
