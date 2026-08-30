@@ -6,19 +6,19 @@ This project develops an AI-based decision system for routing declined/card-paym
 
 For each transaction attempt, the system estimates:
 
-\[
+$$
 P(\text{success}\mid \text{transaction},\text{candidate route},\text{historical state})
-\]
+$$
 
 and then selects a route while respecting route-volume constraints.
 
 The final system is intentionally separated into:
 
-\[
+$$
 \text{prediction}
 \rightarrow
 \text{online constrained decisioning}
-\]
+$$
 
 rather than treating routing as a static classification problem.
 
@@ -44,15 +44,15 @@ The result motivates explicit temporal state rather than a purely static feature
 
 Historical state is represented using exponentially decayed features:
 
-\[
+$$
 w(\Delta t)=0.5^{\Delta t/h}
-\]
+$$
 
 with multiple half-lives:
 
-\[
+$$
 h\in\{3,14,60,180\}\text{ days}
-\]
+$$
 
 across route, merchant, issuer and interaction contexts.
 
@@ -64,25 +64,25 @@ All historical features use information available before the current decision ti
 
 A logical payment can contain multiple attempts:
 
-\[
+$$
 A1 \rightarrow A2 \rightarrow A3
-\]
+$$
 
 Later attempts are selected populations and expose information that did not exist at A1.
 
 Separate XGBoost models therefore estimate:
 
-\[
+$$
 P(S_1\mid X,r_1,H_t)
-\]
+$$
 
-\[
+$$
 P(S_2\mid X,r_2,A1_{observed},H_t)
-\]
+$$
 
-\[
+$$
 P(S_3\mid X,r_3,A1_{observed},A2_{observed},H_t)
-\]
+$$
 
 Current-attempt provider response fields are excluded from the decision-time feature set.
 
@@ -129,15 +129,15 @@ It sees the entire period's candidate transactions and frozen model scores and s
 
 For success:
 
-\[
+$$
 \max_x\sum_{i,r}x_{ir}\hat p_{ir}
-\]
+$$
 
 For expected approved transaction value:
 
-\[
+$$
 \max_x\sum_{i,r}x_{ir}Amount_i\hat p_{ir}
-\]
+$$
 
 The LP is not deployable online. It is used to measure the maximum model-implied opportunity under the stated assumptions.
 
@@ -156,24 +156,24 @@ A greedy rule that always chooses the largest current probability can consume sc
 
 The online policy therefore defines route pressure:
 
-\[
+$$
 Pressure_{r,t}
 =
 \frac{A_{r,t}-B_{r,t}}
 {\max(0.3B_{r,t},1)}
-\]
+$$
 
 and success score:
 
-\[
+$$
 Score_{ir,t}
 =
 \hat p_{ir,t}
 -
 \lambda Pressure_{r,t}
-\]
+$$
 
-where \(\lambda\) controls the strength of the scarcity adjustment.
+where $\lambda$ controls the strength of the scarcity adjustment.
 
 The notebook includes a synthetic four-transaction worked example showing how the route state changes after every decision and why the capacity-aware choice can differ from the raw highest-probability route.
 
@@ -184,20 +184,20 @@ The notebook includes a synthetic four-transaction worked example showing how th
 For the June reference evaluation:
 
 - greedy captures about **46%** of the model-implied LP success opportunity;
-- success pressure with \(\lambda=0.10\) captures about **86%**;
+- success pressure with $\lambda=0.10$ captures about **86%**;
 - the value-oriented policy captures about **85%** of the value LP opportunity.
 
 Capacity behavior also improves materially.
 
 Absolute route deviation is defined as:
 
-\[
+$$
 d_r
 =
 \left|
 \frac{V_r^{policy}}{V_r^{baseline}}-1
 \right|
-\]
+$$
 
 Greedy leaves 9 of 12 routes at or above 27% absolute deviation, i.e. close to the ±30% capacity boundary. The main pressure policies leave only 1 of 12 routes near that boundary.
 
@@ -259,7 +259,7 @@ The project therefore does not claim causal production uplift from offline repla
 
 A production validation path is:
 
-\[
+$$
 \text{offline validation}
 \rightarrow
 \text{shadow deployment}
@@ -267,4 +267,4 @@ A production validation path is:
 \text{controlled A/B test}
 \rightarrow
 \text{production rollout}
-\]
+$$
