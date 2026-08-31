@@ -60,6 +60,40 @@ All historical features use information available before the current decision ti
 
 ---
 
+
+## Cross-feature engineering
+
+The model also includes explicit context × route interactions.
+
+Examples include static crosses such as:
+
+- merchant / card / MCC context with route;
+- `bankcat_route`;
+- `cardtype_route`;
+- `mcc_route`;
+
+and historical interaction state such as:
+
+$$
+P_t(Y=1\mid Merchant,\ Route)
+$$
+
+and:
+
+$$
+P_t(Y=1\mid Issuer,\ Route)
+$$
+
+with the same leakage-safe expanding and exponentially decayed history used elsewhere.
+
+These features encode **route compatibility**, rather than only the separate average quality of a transaction context and a route.
+
+The final notebook validates that these crosses were not merely engineered and ignored: it re-reads the frozen XGBoost importance artifact, reports the **normalized total gain attributable to explicit cross features**, and lists the highest-gain interaction features together with their rank among all features in each A1/A2/A3 model.
+
+The gain analysis is predictive/model-internal evidence rather than causal proof.
+
+---
+
 ## Stage-specific probability models
 
 A logical payment can contain multiple attempts:
