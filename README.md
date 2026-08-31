@@ -2,127 +2,132 @@
 
 ## Project objective
 
-This project develops an AI-based decision system for routing declined/card-payment attempts through alternative payment routes.
+FlexFactor is an AI-based decision system for routing declined/card-payment attempts through alternative payment routes.
 
-For each transaction attempt, the system estimates:
+For every candidate route, the predictive layer estimates:
 
-$$
-P(\text{success}\mid \text{transaction},\text{candidate route},\text{historical state})
-$$
+`P(success | transaction context, candidate route, historical state)`
 
-and then selects a route while respecting route-volume constraints.
+The decision layer then chooses a route while respecting route-volume constraints.
 
-The final system is intentionally separated into:
+The project is therefore not only a binary classifier. Its full flow is:
 
-$$
-\text{prediction}
-\rightarrow
-\text{online constrained decisioning}
-$$
+`transaction → dynamic state → route probabilities → capacity-aware decision → outcome/state update`
 
-rather than treating routing as a static classification problem.
-
-The main graded artifact is:
-
-`FlexFactor_Final_Project.ipynb`
-
-It contains the full methodology, empirical results, architecture, model calibration, optimization benchmarks, a worked online-routing example, and the scientific limitations of the offline evaluation.
+The main graded artifact is **`FlexFactor_Final_Project.ipynb`**. It contains the methodology, empirical results, calibration analysis, feature engineering, model comparison, optimization benchmarks, worked online-routing example, and scientific limitations of the offline evaluation.
 
 ---
 
-## Why the problem is dynamic
+## 1. Why the problem is dynamic
 
-Raw approval rates change through time, but the notebook goes beyond the raw trend.
+Raw approval rates change through time, but a changing aggregate rate can also reflect a changing mix of merchants, routes, cards, or amounts.
 
-Concept drift is examined using:
+The notebook therefore examines drift using three views:
 
-- monthly A1 approval rates;
+- monthly first-attempt approval rates;
 - a traffic-mix-adjusted residual using merchant × route × card type × amount-decile contexts;
-- a large recurring near-comparable cohort selected by volume/stability rather than by observed drift.
+- a large recurring near-comparable cohort selected by volume and recurrence, not by the amount of drift observed.
 
-The result motivates explicit temporal state rather than a purely static feature representation.
-
-Historical state is represented using exponentially decayed features:
-
-$$
-w(\Delta t)=0.5^{\Delta t/h}
-$$
-
-with multiple half-lives:
-
-$$
-h\in\{3,14,60,180\}\text{ days}
-$$
-
-across route, merchant, issuer and interaction contexts.
-
-All historical features use information available before the current decision time.
+The result motivates a model whose representation can change with the environment rather than relying only on static identifiers.
 
 ---
 
+## 2. Feature engineering
 
-## Cross-feature engineering
+### 2.1 Continuous temporal memory
 
-The model also includes explicit context × route interactions.
+Historical performance is represented with exponentially decayed state rather than one hard rolling-window cutoff.
 
-Examples include static crosses such as:
+Conceptually:
 
-- merchant / card / MCC context with route;
-- `bankcat_route`;
-- `cardtype_route`;
-- `mcc_route`;
+```text
+historical weight = 0.5 ^ (age / half-life)
+```
+
+The final representation exposes several memory speeds:
+
+```text
+half-lives = 3, 14, 60, and 180 days
+```
+
+Historical state is maintained across contexts such as route, merchant, issuer, and their interactions.
+
+All historical features obey the decision-time information set: the current outcome is not added until after the feature row for that decision has been emitted.
+
+### 2.2 Cross-feature engineering
+
+A route is not universally good or bad. Its performance can depend on the transaction population being routed through it.
+
+The feature set therefore includes explicit compatibility features such as:
+
+- `bankcat_route`
+- `cardnetwork_route`
+- `cardtype_route`
+- `cardlevel_route`
+- `mcc_route`
 
 and historical interaction state such as:
 
-$$
-P_t(Y=1\mid Merchant,\ Route)
-$$
+- merchant × route
+- issuer × route
+- card type × route
+- MCC × route
 
-and:
+The practical distinction is:
 
-$$
-P_t(Y=1\mid Issuer,\ Route)
-$$
+```text
+route quality alone
+```
 
-with the same leakage-safe expanding and exponentially decayed history used elsewhere.
+versus:
 
-These features encode **route compatibility**, rather than only the separate average quality of a transaction context and a route.
+```text
+route quality for this merchant / issuer / card context
+```
 
-The final notebook validates that these crosses were not merely engineered and ignored: it re-reads the frozen XGBoost importance artifact, reports the **normalized total gain attributable to explicit cross features**, and lists the highest-gain interaction features together with their rank among all features in each A1/A2/A3 model.
+The notebook links this engineering step to the frozen XGBoost feature-importance artifact. It reports the normalized total gain assigned to explicit cross features and lists the strongest cross features together with their rank among all features in each stage model.
 
-The gain analysis is predictive/model-internal evidence rather than causal proof.
+This is model-internal predictive evidence, not a causal feature effect.
 
 ---
 
-## Stage-specific probability models
+## 3. Model-family comparison
+
+Model comparison is performed **after the feature representation is defined**.
+
+This is important because comparing two algorithms that receive different information would confound feature engineering with model choice.
+
+The original A1 experiment compares CatBoost, LightGBM, XGBoost, and a linear SGD/logistic baseline on the same frozen feature architecture and chronological development folds. XGBoost is the final selected model family.
+
+---
+
+## 4. Stage-specific probability models
 
 A logical payment can contain multiple attempts:
 
-$$
-A1 \rightarrow A2 \rightarrow A3
-$$
+```text
+A1 → A2 → A3
+```
 
-Later attempts are selected populations and expose information that did not exist at A1.
+Later attempts are selected populations and contain information that did not exist at the first attempt.
 
-Separate XGBoost models therefore estimate:
+The final system therefore uses separate models:
 
-$$
-P(S_1\mid X,r_1,H_t)
-$$
+```text
+A1: P(success | current transaction, candidate route, historical state)
 
-$$
-P(S_2\mid X,r_2,A1_{observed},H_t)
-$$
+A2: P(success | current transaction, candidate route,
+                observed A1 state, historical state)
 
-$$
-P(S_3\mid X,r_3,A1_{observed},A2_{observed},H_t)
-$$
+A3: P(success | current transaction, candidate route,
+                observed A1 + A2 state, historical state)
+```
 
-Current-attempt provider response fields are excluded from the decision-time feature set.
+Current-attempt provider response fields are excluded because they are only known after the attempt occurs.
 
 ---
 
-## Dataset
+## 5. Dataset
 
 The standardized attempt-level dataset contains approximately:
 
@@ -131,7 +136,7 @@ The standardized attempt-level dataset contains approximately:
 | A1 | 595,434 | 8.52% |
 | A2 | 317,819 | 4.91% |
 | A3 | 122,900 | 1.80% |
-| **Total attempts** | **1,036,153** | — |
+| **Total attempt rows** | **1,036,153** | — |
 
 There are approximately **595,434 logical transactions**.
 
@@ -139,7 +144,7 @@ The company transaction dataset is not redistributed publicly.
 
 ---
 
-## Predictive results
+## 6. Predictive results
 
 Untouched June evaluation:
 
@@ -149,95 +154,143 @@ Untouched June evaluation:
 | A2 | 0.794 | 0.212 | 0.151 | 0.0440 | 0.0019 |
 | A3 | 0.871 | 0.137 | 0.207 | 0.0180 | 0.0026 |
 
-The notebook also compares mean predicted probability with the success actually observed on the logged route and shows fixed-probability-bin reliability curves.
+The notebook also compares the mean predicted probability with the success rate actually observed on the logged route and presents fixed-probability-bin reliability diagrams.
 
-The sparse high-probability A2/A3 bins are retained in the calibration figure, but their transaction counts and share of the stage population are reported directly so that visually extreme points are interpreted in proportion to the small amount of evidence behind them.
+The sparse high-probability A2/A3 bins are retained rather than hidden, but the number of transactions behind those visually unusual points is shown explicitly.
 
 ---
 
-## Offline LP benchmark
+## 7. Offline LP benchmark
 
-The linear program is a **month-end full-hindsight oracle**.
+The linear program is a **full-hindsight benchmark**, not the live routing algorithm.
 
-It sees the entire period's candidate transactions and frozen model scores and solves the globally optimal assignment under route constraints.
+At the end of the evaluation period, it sees the entire set of transactions and their frozen model scores simultaneously and finds the best assignment under the stated route-volume constraints.
 
-For success:
+Success objective:
 
-$$
-\max_x\sum_{i,r}x_{ir}\hat p_{ir}
-$$
+```text
+maximize the sum of predicted success probabilities
+across all transaction-route assignments
+```
 
-For expected approved transaction value:
+Approved-value objective:
 
-$$
-\max_x\sum_{i,r}x_{ir}Amount_i\hat p_{ir}
-$$
+```text
+maximize the sum of:
+transaction amount × predicted success probability
+```
 
-The LP is not deployable online. It is used to measure the maximum model-implied opportunity under the stated assumptions.
+Because the LP sees the full period, it answers:
+
+> If the entire period had been known in advance, what is the best model-implied assignment under the constraints?
+
+It establishes the **100% model-implied opportunity benchmark** against which chronological policies can be compared.
 
 Reference June results:
 
-- success-optimal LP: **+188.8 model-implied approvals** and approximately **+1.299M expected approved transaction value**;
-- value-optimal LP: approximately **+1.424M expected approved transaction value**.
+- success-optimal LP: **+188.8 model-implied approvals** and about **+1.299M expected approved transaction value**;
+- value-optimal LP: about **+1.424M expected approved transaction value**.
+
+These are counterfactual model estimates, not causal production uplift.
 
 ---
 
-## Online capacity-aware policy
+## 8. Online capacity-aware policy
 
-A live router cannot see future transactions.
+The production-style problem is different from the LP because future transactions are unknown.
 
-A greedy rule that always chooses the largest current probability can consume scarce route capacity too early.
+When a transaction arrives, the system must choose a route immediately using only:
 
-The online policy therefore defines route pressure:
+- the current transaction;
+- currently eligible routes;
+- current historical state;
+- capacity already consumed.
 
-$$
-Pressure_{r,t}
-=
-\frac{A_{r,t}-B_{r,t}}
-{\max(0.3B_{r,t},1)}
-$$
+A greedy policy always chooses the largest current predicted success probability. This can consume a strong route too aggressively early in the period.
 
-and success score:
+The online policy therefore adds a route-pressure term.
 
-$$
-Score_{ir,t}
-=
-\hat p_{ir,t}
--
-\lambda Pressure_{r,t}
-$$
+In plain notation:
 
-where $\lambda$ controls the strength of the scarcity adjustment.
+```text
+pressure(route, time)
+    =
+    (policy cumulative use - baseline cumulative use)
+    / max(0.30 × baseline cumulative use, 1)
+```
 
-The notebook includes a synthetic four-transaction worked example showing how the route state changes after every decision and why the capacity-aware choice can differ from the raw highest-probability route.
+The success-oriented decision score is:
+
+```text
+adjusted score
+    =
+    predicted success probability
+    - lambda × route pressure
+```
+
+`lambda` controls how strongly route scarcity affects the decision:
+
+| Lambda behavior | Interpretation |
+|---|---|
+| `lambda = 0` | greedy probability maximization |
+| small positive lambda | scarcity matters when route probabilities are close |
+| larger lambda | stronger willingness to preserve an over-used route |
+
+The reference success policy uses **lambda = 0.10**.
+
+The notebook includes a synthetic four-transaction example showing the full chronological process and how earlier route choices change the state used for later decisions.
 
 ---
 
-## Optimization results
+## 9. Capacity and optimization results
 
 For the June reference evaluation:
 
 - greedy captures about **46%** of the model-implied LP success opportunity;
-- success pressure with $\lambda=0.10$ captures about **86%**;
-- the value-oriented policy captures about **85%** of the value LP opportunity.
+- success pressure with **lambda = 0.10** captures about **86%**;
+- the value-oriented pressure policy captures about **85%** of the value LP opportunity.
 
-Capacity behavior also improves materially.
+Route deviation is defined as:
 
-Absolute route deviation is defined as:
+```text
+absolute route deviation
+    =
+    absolute value of:
+    (policy route volume / baseline route volume) - 1
+```
 
-$$
-d_r
-=
-\left|
-\frac{V_r^{policy}}{V_r^{baseline}}-1
-\right|
-$$
+Example: a deviation of `0.10` means the final route volume is 10% away from the baseline volume.
 
-Greedy leaves 9 of 12 routes at or above 27% absolute deviation, i.e. close to the ±30% capacity boundary. The main pressure policies leave only 1 of 12 routes near that boundary.
+The main capacity constraint is approximately ±30% around the reference route volume. A route is called **near the boundary** when its absolute deviation is at least 27%, i.e. within three percentage points of that limit.
+
+Observed capacity behavior:
+
+- greedy: 9 of 12 routes near the boundary; mean absolute route deviation about 26%;
+- success pressure, lambda = 0.10: 1 of 12 near the boundary; mean absolute deviation about 10%;
+- nearby pressure policies show similarly controlled aggregate behavior.
 
 ---
 
-## Repository structure
+## 10. Robustness
+
+The later-period robustness analysis checks whether the result depends on one finely tuned lambda value.
+
+Moderate success-pressure settings remain stronger than greedy on model-implied approvals, while the value-oriented setting trades some modeled approvals for greater expected approved transaction value.
+
+Movement is defined as:
+
+```text
+movement rate
+    =
+    share of replayed events where:
+    policy route != historically logged route
+```
+
+Movement measures how much operational behavior changes. It is not itself a measure of benefit.
+
+---
+
+## 11. Repository structure
 
 ```text
 FlexFactor_Final_Project.ipynb
@@ -263,27 +316,27 @@ artifacts/
     reference_policy_results.csv
 ```
 
-`src/features.py` contains leakage-safe temporal/cross-feature utilities.
+`src/features.py` contains leakage-safe temporal and interaction-feature utilities.
 
-`src/models.py` contains probability-model and evaluation utilities.
+`src/models.py` contains predictive-model and probability-evaluation utilities.
 
-`src/optimization.py` contains the LP, capacity and online pressure-policy implementation.
+`src/optimization.py` contains LP, capacity, greedy, and pressure-policy logic.
 
-`src/showcase.py` discovers the frozen artifacts and exports compact exact model configurations for reproducibility.
+`src/showcase.py` discovers frozen artifacts and exports compact model configurations for reproducibility.
 
 ---
 
-## Reproducibility
+## 12. Reproducibility
 
-The public repository contains code, configuration and compact result artifacts.
+The public repository contains code, configuration, the final notebook, and compact result artifacts.
 
 Large/private transaction data and heavy frozen model artifacts remain in the authorized project Google Drive.
 
-The notebook mounts the authorized Drive, discovers the saved artifacts, and uses those frozen checkpoints rather than retraining models during the presentation run.
+The notebook mounts the authorized Drive, discovers the existing frozen checkpoints, and uses them rather than retraining the full project during the showcase run.
 
 ---
 
-## Scientific limitation
+## 13. Scientific limitation
 
 Observed-route predictive metrics are factual historical evaluations.
 
@@ -291,14 +344,14 @@ Alternative-route policy gains are **model-implied counterfactual estimates** be
 
 The project therefore does not claim causal production uplift from offline replay.
 
-A production validation path is:
+The intended validation path is:
 
-$$
-\text{offline validation}
-\rightarrow
-\text{shadow deployment}
-\rightarrow
-\text{controlled A/B test}
-\rightarrow
-\text{production rollout}
-$$
+```text
+offline validation
+    ↓
+shadow deployment
+    ↓
+controlled A/B test
+    ↓
+production rollout
+```
